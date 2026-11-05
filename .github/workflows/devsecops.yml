@@ -1,0 +1,204 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  # =========================================================================
+  # (1) ESCANEO DE SECRETOS CON GITLEAKS (CONTROL BLOQUEANTE)
+  # =========================================================================
+  secret-scan:
+    name: 1. Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar código del repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ejecutar Gitleaks en modo bloqueante
+        # Sin continue-on-error: si detecta un secreto devuelve código 1 y detiene el pipeline
+        run: |
+          wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz
+          tar -xzf gitleaks_8.18.4_linux_x64.tar.gz
+          ./gitleaks detect --source . --log-opts="-1" --report-format json --report-path gitleaks-report.json --redact --verbose
+
+      - name: Guardar artefacto de Gitleaks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+
+  # =========================================================================
+  # (2A) COMPOSICIÓN DE SOFTWARE (SBOM) CON SYFT - EN PARALELO
+  # =========================================================================
+  sbom-syft:
+    name: 2A. SBOM (Syft)
+    needs: [secret-scan]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Descargar código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Syft y generar SBOM
+        continue-on-error: true
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft dir:. -o cyclonedx-json=sbom-syft.json
+
+      - name: Guardar artefacto SBOM (Syft)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-syft-report
+          path: sbom-syft.json
+
+  # =========================================================================
+  # (2B) VULNERABILIDADES EN DEPENDENCIAS (SCA) CON GRYPE - EN PARALELO
+  # =========================================================================
+  sca-grype:
+    name: 2B. SCA (Grype)
+    needs: [secret-scan]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Descargar código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Grype y analizar dependencias
+        continue-on-error: true
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          grype dir:. -o json > grype-report.json || true
+
+      - name: Guardar artefacto SCA (Grype)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-report
+          path: grype-report.json
+
+  # =========================================================================
+  # (3) SAST CON SNYK CODE
+  # =========================================================================
+  sast-snyk:
+    name: 3. SAST (Snyk Code)
+    needs: [sbom-syft, sca-grype]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Descargar código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Ejecutar Snyk Code
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          npm install -g snyk
+          snyk code test --sarif-file-output=snyk-code.sarif --json-file-output=snyk-code.json || true
+
+      - name: Guardar artefacto SAST (Snyk Code)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-code-report
+          path: |
+            snyk-code.sarif
+            snyk-code.json
+
+  # =========================================================================
+  # (4) DAST CON OWASP ZAP EN MODO BASELINE
+  # =========================================================================
+  dast-zap:
+    name: 4. DAST (OWASP ZAP Baseline)
+    needs: [sast-snyk]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Ejecutar escaneo OWASP ZAP Baseline
+        continue-on-error: true
+        run: |
+          chmod 777 $(pwd)
+          docker run --rm -v $(pwd):/zap/wrk/:rw -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t http://3.95.181.72:3001/ \
+            -x zap-report.xml \
+            -J zap-report.json \
+            -r zap-report.html \
+            -I || true
+
+      - name: Guardar artefacto DAST (OWASP ZAP)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: |
+            zap-report.xml
+            zap-report.json
+            zap-report.html
+
+  # =========================================================================
+  # (5) SUBIDA DE RESULTADOS A DEFECTDOJO (API v2 import-scan)
+  # =========================================================================
+  upload-defectdojo:
+    name: 5. Upload to DefectDojo
+    needs: [dast-zap]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      DD_URL: ${{ secrets.DEFECTDOJO_URL }}
+      DD_TOKEN: ${{ secrets.DEFECTDOJO_TOKEN }}
+      PRODUCT_INITIALS: "IL"
+    steps:
+      - name: Descargar todos los artefactos generados
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Subir reporte de Grype (SCA) a DefectDojo
+        run: |
+          curl -f -X POST "${DD_URL}/api/v2/import-scan/" \
+            -H "Authorization: Token ${DD_TOKEN}" \
+            -F "scan_type=Anchore Grype" \
+            -F "file=@artifacts/grype-report/grype-report.json" \
+            -F "product_type_name=Research and Development" \
+            -F "product_name=${PRODUCT_INITIALS}" \
+            -F "engagement_name=CI-CD-GitHub-Actions" \
+            -F "auto_create_context=true" \
+            -F "minimum_severity=Info" \
+            -F "active=true" \
+            -F "verified=false"
+
+      - name: Subir reporte de Snyk Code (SAST) a DefectDojo
+        run: |
+          curl -f -X POST "${DD_URL}/api/v2/import-scan/" \
+            -H "Authorization: Token ${DD_TOKEN}" \
+            -F "scan_type=SARIF" \
+            -F "file=@artifacts/snyk-code-report/snyk-code.sarif" \
+            -F "product_type_name=Research and Development" \
+            -F "product_name=${PRODUCT_INITIALS}" \
+            -F "engagement_name=CI-CD-GitHub-Actions" \
+            -F "auto_create_context=true" \
+            -F "minimum_severity=Info" \
+            -F "active=true" \
+            -F "verified=false"
+
+      - name: Subir reporte de OWASP ZAP (DAST) a DefectDojo
+        run: |
+          curl -f -X POST "${DD_URL}/api/v2/import-scan/" \
+            -H "Authorization: Token ${DD_TOKEN}" \
+            -F "scan_type=ZAP Scan" \
+            -F "file=@artifacts/zap-report/zap-report.xml" \
+            -F "product_type_name=Research and Development" \
+            -F "product_name=${PRODUCT_INITIALS}" \
+            -F "engagement_name=CI-CD-GitHub-Actions" \
+            -F "auto_create_context=true" \
+            -F "minimum_severity=Info" \
+            -F "active=true" \
+            -F "verified=false"
